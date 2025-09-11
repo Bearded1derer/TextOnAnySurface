@@ -1,0 +1,675 @@
+# -*- coding: utf-8 -*-
+#
+#
+# Author: Bearded1derer, with Gemini
+#
+# This macro automates the process of adding multi-line text to a selected face of an object.
+#
+# It performs the following steps:
+# 1. Prompts for multi-line text, font, size, justification, line spacing, and projection properties.
+# 2. For standard faces, it uses the Curves Workbench 'Sketch on Surface' tool for projection and now includes auto-scaling.
+# 3. For annular faces (rings), it uses a custom function to create curved text.
+# 4. Intelligently determines the bounds of the face.
+# 5. Performs a Part Cut or Fuse operation using the more robust BOPTools (Part_CompJoinFeatures).
+#
+# Instructions:
+# 1. Install the 'Curves' workbench from the Addon Manager.
+# 2. To use: Select a single face on a solid object and run this macro.
+#
+
+import sys
+import os
+import re
+import time # Added for stability delay
+import math # Added for circle calculations
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+import Draft
+import BOPTools.JoinFeatures # Use the more robust boolean tools
+
+# Check for PySide2, the GUI toolkit used by modern FreeCAD versions
+try:
+    from PySide2 import QtWidgets, QtCore
+except ImportError:
+    from PySide import QtCore, QtGui as QtWidgets
+
+# --- User Input Dialog ---
+class UserInputDialog(QtWidgets.QDialog):
+    """
+    A custom dialog box to gather all necessary information from the user.
+    """
+    def __init__(self, parent=None):
+        super(UserInputDialog, self).__init__(parent)
+        self.setWindowTitle("Create Text on Face")
+
+        # --- Data storage ---
+        try:
+            macro_dir = os.path.dirname(__file__)
+        except NameError:
+            macro_dir = App.getUserMacroDir(True)
+        self.config_path = os.path.join(macro_dir, "font_config.txt")
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                default_font = f.read().strip()
+        except FileNotFoundError:
+            default_font = ""
+
+        # Set data from initial values or defaults
+        self.text = "Your Text\nHere"
+        self.font_path = default_font
+        self.operation = "Raised"
+        self.font_size = 10.0
+        self.line_spacing = 1.2
+        self.justification = "Center"
+        self.offset = -0.5 # Note: Offset is not used for curved text
+        self.thickness = 1.0
+        self.reverse_u = False
+        self.reverse_v = True
+        self.swap_uv = False
+        self.result = False
+
+        # --- Widgets ---
+        self.text_label = QtWidgets.QLabel("Text:")
+        self.text_input = QtWidgets.QTextEdit()
+        self.text_input.setText(self.text)
+        self.text_input.setMinimumHeight(60)
+
+        self.font_label = QtWidgets.QLabel("Font File:")
+        self.font_input = QtWidgets.QLineEdit(self.font_path)
+        self.font_button = QtWidgets.QPushButton("Browse...")
+
+        self.font_size_label = QtWidgets.QLabel("Font Size (auto-scales if too large):")
+        self.font_size_spinbox = QtWidgets.QDoubleSpinBox()
+        self.font_size_spinbox.setDecimals(2)
+        self.font_size_spinbox.setRange(0.01, 10000.0)
+        self.font_size_spinbox.setValue(self.font_size)
+        self.font_size_spinbox.setSuffix(" mm")
+        
+        self.line_spacing_label = QtWidgets.QLabel("Line Spacing:")
+        self.line_spacing_spinbox = QtWidgets.QDoubleSpinBox()
+        self.line_spacing_spinbox.setDecimals(2)
+        self.line_spacing_spinbox.setRange(0.1, 10.0)
+        self.line_spacing_spinbox.setValue(self.line_spacing)
+        self.line_spacing_spinbox.setSingleStep(0.1)
+        self.line_spacing_spinbox.setToolTip("Multiplier for font size (e.g., 1.2 = 120%)")
+
+        self.justification_label = QtWidgets.QLabel("Justification:")
+        self.justification_combo = QtWidgets.QComboBox()
+        self.justification_combo.addItems(["Left", "Center", "Right"])
+        self.justification_combo.setCurrentText(self.justification)
+
+        self.op_label = QtWidgets.QLabel("Operation:")
+        self.op_combo = QtWidgets.QComboBox()
+        self.op_combo.addItems(["Raised", "Cut"])
+        self.op_combo.setCurrentText(self.operation)
+
+        # SoS Properties
+        self.offset_label = QtWidgets.QLabel("Offset:")
+        self.offset_spinbox = QtWidgets.QDoubleSpinBox()
+        self.offset_spinbox.setDecimals(2)
+        self.offset_spinbox.setRange(-1000.0, 1000.0)
+        self.offset_spinbox.setValue(self.offset)
+        self.offset_spinbox.setSuffix(" mm")
+
+        self.thickness_label = QtWidgets.QLabel("Thickness/Depth:")
+        self.thickness_spinbox = QtWidgets.QDoubleSpinBox()
+        self.thickness_spinbox.setDecimals(2)
+        self.thickness_spinbox.setRange(0.01, 1000.0)
+        self.thickness_spinbox.setValue(self.thickness)
+        self.thickness_spinbox.setSuffix(" mm")
+
+        self.reverse_u_checkbox = QtWidgets.QCheckBox("Reverse U")
+        self.reverse_u_checkbox.setChecked(self.reverse_u)
+        self.reverse_v_checkbox = QtWidgets.QCheckBox("Reverse V")
+        self.reverse_v_checkbox.setChecked(self.reverse_v)
+        self.swap_uv_checkbox = QtWidgets.QCheckBox("Swap UV")
+        self.swap_uv_checkbox.setChecked(self.swap_uv)
+
+        self.ok_button = QtWidgets.QPushButton("OK")
+        self.cancel_button = QtWidgets.QPushButton("Cancel")
+
+        # --- Layout ---
+        layout = QtWidgets.QGridLayout()
+        row = 0
+        layout.addWidget(self.text_label, row, 0, QtCore.Qt.AlignTop)
+        layout.addWidget(self.text_input, row, 1, 1, 2)
+        row += 1
+        
+        font_layout = QtWidgets.QHBoxLayout()
+        font_layout.addWidget(self.font_input)
+        font_layout.addWidget(self.font_button)
+        layout.addWidget(self.font_label, row, 0)
+        layout.addLayout(font_layout, row, 1, 1, 2)
+        row += 1
+        
+        layout.addWidget(self.font_size_label, row, 0)
+        layout.addWidget(self.font_size_spinbox, row, 1)
+        row += 1
+        
+        layout.addWidget(self.line_spacing_label, row, 0)
+        layout.addWidget(self.line_spacing_spinbox, row, 1)
+        row += 1
+        
+        layout.addWidget(self.justification_label, row, 0)
+        layout.addWidget(self.justification_combo, row, 1)
+        row += 1
+
+        layout.addWidget(self.op_label, row, 0)
+        layout.addWidget(self.op_combo, row, 1)
+        row += 1
+
+        # Group box for properties
+        props_groupbox = QtWidgets.QGroupBox("Properties")
+        props_layout = QtWidgets.QGridLayout()
+        props_layout.addWidget(self.thickness_label, 0, 0)
+        props_layout.addWidget(self.thickness_spinbox, 0, 1)
+        props_layout.addWidget(self.offset_label, 1, 0)
+        props_layout.addWidget(self.offset_spinbox, 1, 1)
+        props_layout.addWidget(self.reverse_u_checkbox, 2, 0)
+        props_layout.addWidget(self.reverse_v_checkbox, 2, 1)
+        props_layout.addWidget(self.swap_uv_checkbox, 3, 0)
+        props_groupbox.setLayout(props_layout)
+        layout.addWidget(props_groupbox, row, 0, 1, 3)
+        row += 1
+
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.ok_button)
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout, row, 0, 1, 3)
+
+        self.setLayout(layout)
+
+        # --- Connections ---
+        self.font_button.clicked.connect(self.browse_font)
+        self.ok_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+
+    def browse_font(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Font File", "", "Font Files (*.ttf *.otf *.pfb)")
+        if path:
+            self.font_input.setText(path)
+
+    def accept(self):
+        control_chars = ''.join(map(chr, list(range(0,32)) + list(range(127,160))))
+        control_char_re = re.compile('[%s]' % re.escape(control_chars))
+        cleaned_path = control_char_re.sub('', self.font_input.text())
+
+        self.text = self.text_input.toPlainText()
+        self.font_path = cleaned_path
+        self.operation = self.op_combo.currentText()
+        self.font_size = self.font_size_spinbox.value()
+        self.justification = self.justification_combo.currentText()
+        self.line_spacing = self.line_spacing_spinbox.value()
+        self.offset = self.offset_spinbox.value()
+        self.thickness = self.thickness_spinbox.value()
+        self.reverse_u = self.reverse_u_checkbox.isChecked()
+        self.reverse_v = self.reverse_v_checkbox.isChecked()
+        self.swap_uv = self.swap_uv_checkbox.isChecked()
+
+        if not self.text.strip() or not self.font_path:
+            QtWidgets.QMessageBox.warning(self, "Input Error", "Text and Font File cannot be empty.")
+            return
+
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                f.write(self.font_path)
+        except Exception as e:
+            App.Console.PrintWarning(f"Could not save font path to {self.config_path}: {e}\n")
+
+        self.result = True
+        super(UserInputDialog, self).accept()
+
+    def reject(self):
+        self.result = False
+        super(UserInputDialog, self).reject()
+
+# --- Helper Functions ---
+def get_unique_name(doc, base_name):
+    """Checks if a name exists and returns a unique version (e.g., 'Name_001')."""
+    clean_base_name = re.sub(r'[^\w\d_]', '_', base_name)
+    if not doc.getObject(clean_base_name):
+        return clean_base_name
+    
+    i = 1
+    while True:
+        new_name = f"{clean_base_name}_{i:03d}"
+        if not doc.getObject(new_name):
+            return new_name
+        i += 1
+
+def get_face_properties(original_object, original_face, mapped_sketch):
+    """
+    Determines if a face is an annulus, a simple circle, or a standard shape 
+    and returns its properties.
+    """
+    if not original_object or not original_face:
+        return None
+
+    props = {'is_annulus': False, 'is_simple_circle': False}
+    
+    # --- Annulus (hollow circle) detection ---
+    if isinstance(original_face.Surface, Part.Plane) and len(original_face.Wires) == 2:
+        try:
+            wire1, wire2 = original_face.Wires
+            if (len(wire1.Edges) == 1 and isinstance(wire1.Edges[0].Curve, Part.Circle) and
+                len(wire2.Edges) == 1 and isinstance(wire2.Edges[0].Curve, Part.Circle)):
+                
+                circle1 = wire1.Edges[0].Curve
+                circle2 = wire2.Edges[0].Curve
+                
+                if circle1.Center.isEqual(circle2.Center, 1e-6):
+                    props['is_annulus'] = True
+                    props['outer_radius'] = max(circle1.Radius, circle2.Radius)
+                    props['inner_radius'] = min(circle1.Radius, circle2.Radius)
+                    props['placement'] = original_object.Placement
+                    props['normal'] = original_face.normalAt(0,0)
+                    return props
+        except Exception:
+            pass 
+
+    if not mapped_sketch or not mapped_sketch.Geometry:
+        return None
+
+    # Get basic bounds from the mapped sketch
+    x_coords = [p.x for geo in mapped_sketch.Geometry for p in (getattr(geo, 'StartPoint', None), getattr(geo, 'EndPoint', None)) if p]
+    y_coords = [p.y for geo in mapped_sketch.Geometry for p in (getattr(geo, 'StartPoint', None), getattr(geo, 'EndPoint', None)) if p]
+    if not x_coords or not y_coords: 
+        return None
+
+    min_x_map, max_x_map = min(x_coords), max(x_coords)
+    min_y_map, max_y_map = min(y_coords), max(y_coords)
+    center_x = (min_x_map + max_x_map) / 2.0
+    center_y = (min_y_map + max_y_map) / 2.0
+
+    # --- Simple circle detection ---
+    if isinstance(original_face.Surface, Part.Plane) and len(original_face.Wires) == 1:
+        wire = original_face.Wires[0]
+        if len(wire.Edges) == 1 and isinstance(wire.Edges[0].Curve, Part.Circle):
+            props['is_simple_circle'] = True
+            radius = wire.Edges[0].Curve.Radius
+            # Calculate bounds of an inscribed square for safe text placement
+            side = (radius * 2) / math.sqrt(2)
+            half_side = side / 2.0
+            props.update({
+                'min_x': center_x - half_side, 'max_x': center_x + half_side,
+                'min_y': center_y - half_side, 'max_y': center_y + half_side,
+                'sketch_width': side, 'sketch_height': side
+            })
+            return props
+
+    # --- Fallback for rectangles and other shapes ---
+    props.update({
+        'min_x': min_x_map, 'max_x': max_x_map,
+        'min_y': min_y_map, 'max_y': max_y_map,
+        'sketch_width': max_x_map - min_x_map, 'sketch_height': max_y_map - min_y_map
+    })
+    return props
+
+# --- Main Macro Logic ---
+
+def create_standard_text_objects(doc, settings):
+    """Creates, scales, and positions straight ShapeString objects for SoS."""
+    lines = [line for line in settings['text'].splitlines() if line.strip()]
+    if not lines:
+        App.Console.PrintWarning("No text provided.\n")
+        return None, settings
+
+    ss_list = []
+    for i, line in enumerate(lines):
+        ss_label = get_unique_name(doc, f"ShapeString_{i}_{line[:10]}")
+        ss = Draft.make_shapestring(String=line, FontFile=settings['font_path'], Size=settings['font_size'])
+        ss.Label = ss_label
+        ss_list.append(ss)
+    doc.recompute()
+    
+    # --- Auto-Scaling for SoS ---
+    max_ss_width = max(ss.Shape.BoundBox.XLength for ss in ss_list) if ss_list else 0
+    font_size_before_scale = ss_list[0].Size.Value
+    line_height_before_scale = font_size_before_scale * settings['line_spacing']
+    total_text_height_before_scale = (len(lines) - 1) * line_height_before_scale + font_size_before_scale
+
+    sketch_width = settings.get('sketch_width', 1)
+    sketch_height = settings.get('sketch_height', 1)
+
+    width_scale_factor = 1.0
+    if max_ss_width > 0:
+        width_scale_factor = (sketch_width * 0.95) / max_ss_width
+
+    height_scale_factor = 1.0
+    if total_text_height_before_scale > 0:
+        height_scale_factor = (sketch_height * 0.95) / total_text_height_before_scale
+        
+    final_scale_factor = min(width_scale_factor, height_scale_factor)
+
+    if final_scale_factor < 0.999: # Only scale if there's a meaningful change
+        App.Console.PrintMessage(f"Text is too large for the face. Auto-scaling by a factor of {final_scale_factor:.2f}.\n")
+        for ss in ss_list:
+            ss.Size = ss.Size * final_scale_factor
+        settings['font_size'] = ss_list[0].Size.Value # Update settings with new size
+        doc.recompute()
+
+    # --- Positioning ---
+    font_size = settings['font_size']
+    line_height = font_size * settings['line_spacing']
+    num_lines = len(lines)
+    
+    min_x, max_x = settings.get('min_x', 0), settings.get('max_x', 0)
+    min_y, max_y = settings.get('min_y', 0), settings.get('max_y', 0)
+    sketch_center_y = (min_y + max_y) / 2.0
+    
+    justification_map = {"Left": "Middle-Left", "Center": "Middle-Center", "Right": "Middle-Right"}
+    ss_justification = justification_map.get(settings['justification'], "Middle-Center")
+
+    for i, ss in enumerate(ss_list):
+        ss.Justification = ss_justification
+        y_pos = sketch_center_y - ( (i - (num_lines - 1) / 2.0) * line_height )
+        
+        if settings['justification'] == 'Left':
+            ss.Placement.Base = App.Vector(min_x, y_pos, 0)
+        elif settings['justification'] == 'Center':
+            ss.Placement.Base = App.Vector((min_x + max_x) / 2.0, y_pos, 0)
+        elif settings['justification'] == 'Right':
+            ss.Placement.Base = App.Vector(max_x, y_pos, 0)
+    doc.recompute()
+
+    return ss_list, settings
+
+def create_curved_text_solid(doc, all_created_objects, settings, props):
+    """Creates a 3D solid from text curved along a circular path."""
+    text_string = settings['text'].replace('\n', ' ').strip() # Ensure single line for curved
+    font_size = settings['font_size']
+    font_path = settings['font_path']
+    thickness = settings['thickness']
+    
+    path_radius = props['inner_radius'] + (props['outer_radius'] - props['inner_radius']) / 2.0
+    
+    # --- Font Size Calculation (Iterative Approach) ---
+    final_font_size = font_size
+    max_iterations = 10
+    
+    max_size_from_height = (props['outer_radius'] - props['inner_radius']) * 0.85
+    if final_font_size > max_size_from_height:
+        final_font_size = max_size_from_height
+        App.Console.PrintMessage(f"Font size reduced to {final_font_size:.2f}mm to fit ring height.\n")
+
+    for i in range(max_iterations):
+        temp_objects = []
+        total_arc_length = 0
+        kerning = final_font_size * 0.10
+
+        for j, char in enumerate(text_string):
+            if char.isspace():
+                total_arc_length += final_font_size * 0.5
+                continue
+            ss = Draft.make_shapestring(String=char, FontFile=font_path, Size=final_font_size)
+            temp_objects.append(ss)
+            width = ss.Shape.BoundBox.XLength
+            if j < len(text_string) - 1 and not text_string[j+1].isspace():
+                width += kerning
+            total_arc_length += width
+        
+        for obj in temp_objects:
+            try: doc.removeObject(obj.Name)
+            except: pass
+        doc.recompute()
+        
+        available_circumference = 2 * math.pi * path_radius * 0.95
+        
+        if total_arc_length <= available_circumference:
+            if i > 0:
+                 App.Console.PrintMessage(f"Final font size is {final_font_size:.2f}mm.\n")
+            break
+        else:
+            scale_factor = available_circumference / total_arc_length
+            final_font_size *= scale_factor
+            if i == max_iterations - 1:
+                App.Console.PrintWarning("Could not fit text within the given iterations.\n")
+    
+    # --- Final Creation & Placement ---
+    char_data = []
+    kerning = final_font_size * 0.10
+    for i, char in enumerate(text_string):
+        if char.isspace():
+            char_data.append({'is_space': True, 'width': final_font_size * 0.5})
+            continue
+        
+        ss = Draft.make_shapestring(String=char, FontFile=font_path, Size=final_font_size)
+        all_created_objects.append(ss)
+        
+        width = ss.Shape.BoundBox.XLength
+        if i < len(text_string) - 1 and not text_string[i+1].isspace():
+            width += kerning
+
+        char_data.append({
+            'is_space': False, 'ss': ss,
+            'width': width, 'raw_width': ss.Shape.BoundBox.XLength,
+            'height': ss.Shape.BoundBox.YLength
+        })
+
+    # --- Placement and Extrusion ---
+    char_solids = []
+    total_arc_length_of_text = sum(d['width'] for d in char_data)
+    total_angle_rad = total_arc_length_of_text / path_radius
+    start_angle_rad = 0
+    if settings['justification'] == 'Center': start_angle_rad = -total_angle_rad / 2.0
+    elif settings['justification'] == 'Right': start_angle_rad = -total_angle_rad
+    
+    current_angle_rad = start_angle_rad
+    
+    for d in char_data:
+        if d['is_space']:
+            current_angle_rad += d['width'] / path_radius
+            continue
+
+        ss = d['ss']
+        
+        char_shape = ss.Shape.copy()
+        
+        bb = char_shape.BoundBox
+        center_of_bb = bb.Center
+        char_shape.translate(-center_of_bb)
+        
+        mirror_matrix = App.Matrix()
+        mirror_matrix.scale(-1, 1, 1)
+        char_shape.transformShape(mirror_matrix)
+
+        char_center_angle = current_angle_rad + (d['raw_width'] / (2 * path_radius))
+        
+        placement = App.Placement()
+        placement.Base = App.Vector(path_radius * math.cos(char_center_angle), path_radius * math.sin(char_center_angle), 0)
+        placement.Rotation = App.Rotation(App.Vector(0,0,1), math.degrees(char_center_angle) - 90) 
+        
+        char_shape.transformShape(placement.toMatrix())
+        
+        try:
+            extrusion_depth = thickness * 2.0
+            extrude_dir = App.Vector(0, 0, extrusion_depth)
+            solid_shape = char_shape.extrude(extrude_dir)
+            solid_shape.translate(App.Vector(0, 0, -thickness))
+
+            if solid_shape.Volume > 1e-9:
+                 char_solids.append(solid_shape)
+        except Exception as e:
+            App.Console.PrintWarning(f"Could not extrude character '{ss.String}': {e}\n")
+
+        current_angle_rad += d['width'] / path_radius
+
+    if not char_solids: 
+        App.Console.PrintError("No valid character solids were created.\n")
+        return None
+    
+    fused_shape = char_solids[0]
+    if len(char_solids) > 1:
+        fused_shape = fused_shape.fuse(char_solids[1:])
+    
+    fused_shape.transformShape(props['placement'].toMatrix())
+
+    text_solid_obj = doc.addObject("Part::Feature", get_unique_name(doc, "CurvedTextSolid"))
+    text_solid_obj.Shape = fused_shape
+    all_created_objects.append(text_solid_obj)
+    
+    for obj in all_created_objects:
+        if "ShapeString" in obj.Name:
+            obj.Visibility = False
+            
+    doc.recompute()
+    return text_solid_obj
+
+
+def create_new_text(original_object, selected_face, face_name):
+    """Handles the creation of a new text object from a face selection."""
+    doc = App.activeDocument()
+    all_created_objects = []
+    
+    # --- Always run SoS first for stability, as per original macro design ---
+    objects_before = set(doc.Objects)
+    try:
+        Gui.activateWorkbench("CurvesWorkbench")
+        Gui.runCommand('SoS', 0)
+        Gui.updateGui(); time.sleep(0.5)
+        doc.recompute()
+    except Exception as e:
+        App.Console.PrintError(f"Error running 'SoS' command: {e}\n")
+        return
+
+    new_objects = set(doc.Objects) - objects_before
+    sos_object = next((obj for obj in new_objects if obj.Name.startswith("Sketch_On_Surface")), None)
+
+    if not sos_object:
+         App.Console.PrintError("Could not find 'Sketch_On_Surface' object. The command failed.\n")
+         return
+    all_created_objects.append(sos_object)
+    
+    mapped_sketch = next((child for child in sos_object.OutList if "Mapped_Sketch" in child.Name), None)
+    if not mapped_sketch:
+        App.Console.PrintError("Could not find 'Mapped_Sketch'.\n")
+        doc.removeObject(sos_object.Name) # Clean up the failed SoS object
+        return
+    # --- End of SoS section ---
+
+    # Now, determine the face type
+    props = get_face_properties(original_object, selected_face, mapped_sketch)
+    if not props:
+        App.Console.PrintError("Could not determine properties from face/mapped_sketch.\n")
+        doc.removeObject(sos_object.Name)
+        return
+
+    is_annulus_face = props.get('is_annulus', False)
+    
+    dialog = UserInputDialog(Gui.getMainWindow())
+    if is_annulus_face:
+        dialog.text_label.setText("Text (Single Line Only):")
+        dialog.text_input.setMinimumHeight(30)
+    
+    if not dialog.exec_() or not dialog.result:
+        App.Console.PrintMessage("Macro cancelled by user.\n")
+        doc.removeObject(sos_object.Name)
+        return
+
+    settings = {
+        "text": dialog.text, "font_path": dialog.font_path, "operation": dialog.operation,
+        "font_size": dialog.font_size, "justification": dialog.justification, 
+        "line_spacing": dialog.line_spacing, "offset": dialog.offset, "thickness": dialog.thickness, 
+        "reverse_u": dialog.reverse_u, "reverse_v": dialog.reverse_v, "swap_uv": dialog.swap_uv
+    }
+
+    # For simple circles, the default SoS orientation is often wrong.
+    if props.get('is_simple_circle', False):
+        App.Console.PrintMessage("Simple circle detected. Overriding Reverse V to False.\n")
+        settings['reverse_v'] = False
+        
+    text_solid = None
+    if is_annulus_face:
+        App.Console.PrintMessage("Annular face detected. Creating curved text.\n")
+        doc.removeObject(sos_object.Name)
+        all_created_objects.remove(sos_object)
+        
+        text_solid = create_curved_text_solid(doc, all_created_objects, settings, props)
+        if not text_solid:
+             App.Console.PrintError("Failed to create curved text solid.\n")
+             return
+
+    else: # Original workflow for all other faces
+        App.Console.PrintMessage("Standard face detected. Using Sketch on Surface.\n")
+        settings.update(props)
+        
+        Gui.activateWorkbench("DraftWorkbench")
+        ss_list, settings = create_standard_text_objects(doc, settings)
+        if not ss_list:
+            doc.removeObject(sos_object.Name)
+            return
+        all_created_objects.extend(ss_list)
+
+        sos_object.ExtraObjects = ss_list
+        sos_object.FillFaces = True
+        sos_object.Offset = settings['offset']
+        sos_object.Thickness = settings['thickness']
+        sos_object.ReverseU = settings['reverse_u']
+        sos_object.ReverseV = settings['reverse_v']
+        sos_object.SwapUV = settings['swap_uv']
+        text_solid = sos_object
+
+    doc.recompute()
+    time.sleep(0.5)
+
+    # Final Boolean Operation
+    Gui.activateWorkbench("PartWorkbench")
+    final_name = get_unique_name(doc, f"{original_object.Label}_{settings['operation']}Text")
+
+    if settings['operation'] == "Raised":
+        final_object = BOPTools.JoinFeatures.makeConnect(name=final_name)
+        final_object.Label = final_name
+        final_object.Objects = [original_object, text_solid]
+    else: # Cut
+        final_object = BOPTools.JoinFeatures.makeCutout(name=final_name)
+        final_object.Label = final_name
+        final_object.Base = original_object
+        final_object.Tool = text_solid
+    
+    final_object.Proxy.execute(final_object)
+    final_object.purgeTouched()
+    doc.recompute()
+    
+    if final_object and final_object.Shape.isValid() and final_object.Shape.Volume > 1e-9:
+        original_object.Visibility = False
+        text_solid.Visibility = False
+        for obj in all_created_objects:
+            if obj.Name != text_solid.Name: 
+                try:
+                    obj.Visibility = False
+                except: pass
+        App.Console.PrintMessage("Macro completed successfully!\n")
+    else:
+        App.Console.PrintError("The final boolean operation failed.\n")
+        if final_object: doc.removeObject(final_name)
+        doc.recompute()
+
+def run_macro():
+    """The main entry point for the macro."""
+    doc = App.activeDocument()
+    if not doc:
+        App.Console.PrintWarning("No active document.\n")
+        return
+
+    doc.openTransaction("Create Text on Face") # Start transaction for undo
+
+    selection = Gui.Selection.getSelectionEx()
+    if not selection or len(selection) != 1 or not selection[0].SubObjects or not isinstance(selection[0].SubObjects[0], Part.Face):
+        App.Console.PrintError("Error: Please select exactly one face to create text.\n")
+        doc.abortTransaction() # Abort if selection is invalid
+        return
+
+    original_object = selection[0].Object
+    selected_face = selection[0].SubObjects[0]
+    face_name = selection[0].SubElementNames[0]
+    
+    create_new_text(original_object, selected_face, face_name)
+    
+    doc.commitTransaction() # Commit transaction
+
+
+if __name__ == "__main__":
+    run_macro()
+
