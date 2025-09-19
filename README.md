@@ -19,12 +19,15 @@ It was created by Designify Labs with assistance from Gemini.
 ## 📸 Screenshots
 
 ![Screenshot of the macro dialog box](https://github.com/Bearded1derer/TextOnAnySurface/blob/main/Dialog_Screenshot.png)
+
 *The main user interface for text customization.*
 
 ![Screenshot of text on a flat or standard face](https://github.com/Bearded1derer/TextOnAnySurface/blob/main/Flat_Surface_Screenshot.png)
+
 *Example of "Raised" text on a standard part.*
 
 [![Screenshot of text on an annular face](https://github.com/Bearded1derer/TextOnAnySurface/blob/main/Annular_Surface_Screenshot.png)
+
 *Example of "Cut" curved text on a ring.*
 
 ## ⚙️ Requirements
